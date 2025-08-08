@@ -1,44 +1,114 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>K8s Code Runner</title>
-</head>
-<body>
-    <h1>Run Code in Kubernetes</h1>
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+import * as k8s from "@kubernetes/client-node";
 
-    <label for="language">Language:</label>
-    <select id="language">
-        <option value="python">Python</option>
-        <option value="node">Node.js</option>
-        <option value="go">Go</option>
-        <option value="java">Java</option>
-    </select>
-    <br><br>
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-    <textarea id="code" rows="10" cols="50" placeholder="Write your code here..."></textarea>
-    <br><br>
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
 
-    <button id="runBtn">Run Code</button>
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
-    <h3>Output:</h3>
-    <pre id="output"></pre>
+async function ensureNamespace(namespaceName) {
+  try {
+    const namespaces = await k8sApi.listNamespace();
+    const exists = namespaces.body.items.some(
+      (ns) => ns.metadata?.name === namespaceName
+    );
+    if (exists) {
+      console.log(`Namespace "${namespaceName}" already exists.`);
+      return;
+    }
 
-    <script>
-        document.getElementById("runBtn").addEventListener("click", async () => {
-            const language = document.getElementById("language").value;
-            const code = document.getElementById("code").value;
+    const namespaceManifest = {
+      apiVersion: "v1",
+      kind: "Namespace",
+      metadata: { name: namespaceName },
+    };
 
-            document.getElementById("output").textContent = "Running in Kubernetes...";
+    const created = await k8sApi.createNamespace(namespaceManifest);
+    console.log(`Namespace "${created.body.metadata.name}" created.`);
+  } catch (err) {
+    console.error("Error ensuring namespace:", err);
+  }
+}
 
-            const res = await fetch("/run-code", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ language, code })
-            });
+// Call once at startup
+await ensureNamespace("codespace");
 
-            const data = await res.json();
-            document.getElementById("output").textContent = data.output || data.error;
-        });
-    </script>
-</body>
-</html>
+app.post("/run-code", async (req, res) => {
+  const { language, code } = req.body;
+
+  if (!language || !code) {
+    return res.status(400).json({ error: "Missing language or code" });
+  }
+
+  const podName = `code-runner-${Date.now()}`;
+  const namespace = "codespace";
+
+  const podManifest = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name: podName,
+      namespace: namespace,
+    },
+    spec: {
+      containers: [
+        {
+          name: "runner",
+          image:
+            language === "python"
+              ? "python:3.11"
+              : language === "node"
+              ? "node:22"
+              : "alpine",
+          command:
+            language === "python"
+              ? ["python", "-c", code]
+              : language === "node"
+              ? ["node", "-e", code]
+              : ["sh", "-c", code],
+        },
+      ],
+      restartPolicy: "Never",
+    },
+  };
+
+  try {
+    // Create pod in the 'codespace' namespace
+    await k8sApi.createNamespacedPod(namespace, podManifest);
+
+    // Wait for pod to finish
+    let phase = "";
+    while (phase !== "Succeeded" && phase !== "Failed") {
+      const { body } = await k8sApi.readNamespacedPod(podName, namespace);
+      phase = body.status.phase;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    // Get logs
+    const logs = await k8sApi.readNamespacedPodLog(podName, namespace, "runner");
+
+    // Delete pod
+    await k8sApi.deleteNamespacedPod(podName, namespace);
+
+    res.json({ output: logs.body });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Unknown error" });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public/index.html"));
+});
+
+app.listen(3000, () => {
+  console.log("🚀 Server running at http://localhost:3000");
+});

@@ -1,70 +1,127 @@
+
 import express from "express";
-import { KubeConfig, CoreV1Api } from "@kubernetes/client-node";
+import * as k8s from "@kubernetes/client-node";
 
 const app = express();
-const port = 3000;
-
 app.use(express.json());
 
-const kc = new KubeConfig();
+const kc = new k8s.KubeConfig();
 kc.loadFromDefault();
-const k8sApi = kc.makeApiClient(CoreV1Api);
 
-// Language → image mapping
-const languageConfig = {
-    python: { image: "python:3.10", ext: "py", cmd: "python" },
-    node: { image: "node:18", ext: "js", cmd: "node" },
-    go: { image: "golang:1.20", ext: "go", cmd: "go run" },
-    java: { image: "openjdk:17", ext: "java", cmd: "sh -c 'javac Main.java && java Main'" }
-};
+const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
 
-app.post("/run-code", async (req, res) => {
-    try {
-        const { language, code } = req.body;
-        if (!languageConfig[language]) return res.status(400).json({ error: "Invalid language" });
+app.post('/run-code', async (req, res) => {
+  const { language, code } = req.body;
 
-        const { image, ext, cmd } = languageConfig[language];
-        const podName = `code-run-${Math.floor(Math.random() * 10000)}`;
+  if (typeof code !== "string" || code.length > 1000) {
+    return res.status(400).json({ error: "Invalid or too long code" });
+  }
+  if (!["python", "node", "sh"].includes(language)) {
+    return res.status(400).json({ error: "Unsupported language" });
+  }
 
-        const safeCode = code.replace(/'/g, "'\"'\"'");
-        const runCommand = `echo '${safeCode}' > /tmp/script.${ext} && ${cmd} /tmp/script.${ext}`;
+  const podName = `code-runner-${Date.now()}`;
+  const namespace = "default";
 
-        const podManifest = {
-            metadata: { name: podName },
-            spec: {
-                containers: [{
-                    name: "runner",
-                    image: image,
-                    command: ["sh", "-c", runCommand]
-                }],
-                restartPolicy: "Never"
-            }
-        };
+  const image =
+    language === "python" ? "python:3.11" :
+    language === "node" ? "node:22" : "alpine";
 
-        await k8sApi.createNamespacedPod("default", podManifest);
+  const command =
+    language === "python" ? ["python", "-c", code] :
+    language === "node" ? ["node", "-e", code] : ["sh", "-c", code];
 
-        let phase = "";
-        while (phase !== "Succeeded" && phase !== "Failed") {
-            const { body } = await k8sApi.readNamespacedPod(podName, "default");
-            phase = body.status.phase;
-            await new Promise(r => setTimeout(r, 1000));
-        }
+  const podManifest = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name: podName,
+      namespace,
+    },
+    spec: {
+      containers: [
+        {
+          name: "runner",
+          image,
+          command,
+          resources: {
+            limits: {
+              cpu: "500m",
+              memory: "128Mi",
+            },
+          },
+        },
+      ],
+      restartPolicy: "Never",
+    },
+  };
 
-        const logs = await k8sApi.readNamespacedPodLog(podName, "default", "runner");
+  let podFailed = false;
+  let failureReason = "Execution failed";
 
-        await k8sApi.deleteNamespacedPod(podName, "default");
+  try {
+    // This call adheres to the CoreV1ApiCreateNamespacedPodRequest type.
+    await k8sApi.createNamespacedPod({ namespace, body: podManifest });
 
-        res.json({ output: logs.body });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+    const maxWaitMs = 10000;
+    const pollIntervalMs = 500;
+    const start = Date.now();
+
+    while (true) {
+      // This call adheres to the CoreV1ApiReadNamespacedPodStatusRequest type.
+      // It correctly awaits the V1Pod object directly, as specified by the return type.
+      const pod = await k8sApi.readNamespacedPodStatus({ name: podName, namespace, });
+      const phase = pod.status?.phase;
+
+      if (phase === "Succeeded" || phase === "Failed") {
+        if (phase === "Failed") podFailed = true;
+        break;
+      }
+
+      // Check for unrecoverable container states to fail fast.
+      const containerStatus = pod.status?.containerStatuses?.[0];
+      const waitingState = containerStatus?.state?.waiting;
+      if (waitingState && ['CreateContainerConfigError', 'ImagePullBackOff', 'ErrImagePull'].includes(waitingState.reason)) {
+          podFailed = true;
+          failureReason = waitingState.message || waitingState.reason;
+          break;
+      }
+
+      if (Date.now() - start > maxWaitMs) {
+        await k8sApi.deleteNamespacedPod({ name: podName, namespace });
+        return res.status(504).json({ error: "Execution timed out" });
+      }
+      await new Promise(r => setTimeout(r, pollIntervalMs));
     }
+
+    // Note: readNamespacedPodLog uses a different signature (positional args)
+    // and returns a different object structure ({ response, body }).
+    const logsResponse = await k8sApi.readNamespacedPodLog(podName, namespace, "runner");
+    const logs = logsResponse.body;
+
+    // This call adheres to the CoreV1ApiDeleteNamespacedPodRequest type.
+    await k8sApi.deleteNamespacedPod({ name: podName, namespace });
+
+    if (podFailed) {
+      return res.status(422).json({ error: failureReason, output: logs });
+    }
+
+    res.json({ output: logs });
+  } catch (err) {
+    // Attempt to clean up the pod even if an error occurred elsewhere.
+    await k8sApi.deleteNamespacedPod({ name: podName, namespace }).catch(e => {
+       // Ignore 404 errors, as the pod may have already been deleted or never created.
+       if (e.statusCode !== 404) {
+         console.error("Failed to cleanup pod:", e.body?.message || e.message);
+       }
+    });
+
+    console.error(err);
+    const errorMessage = err.body?.message || err.message;
+    res.status(500).json({ error: "Failed to run code", details: errorMessage });
+  }
 });
 
-app.get("/", (req, res) => {
-    res.sendFile(__dirname + "/index.html");
-});
-
-app.listen(port, () => {
-    console.log(`🚀 App running at http://localhost:${port}`);
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
 });
