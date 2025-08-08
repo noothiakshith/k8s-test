@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>K8s Code Runner</title>
+</head>
+<body>
+    <h1>Run Code in Kubernetes</h1>
+
+    <label for="language">Language:</label>
+    <select id="language">
+        <option value="python">Python</option>
+        <option value="node">Node.js</option>
+        <option value="go">Go</option>
+        <option value="java">Java</option>
+    </select>
+    <br><br>
+
+    <textarea id="code" rows="10" cols="50" placeholder="Write your code here..."></textarea>
+    <br><br>
+
+    <button id="runBtn">Run Code</button>
+
+    <h3>Output:</h3>
+    <pre id="output"></pre>
+
+    <script>
+        document.getElementById("runBtn").addEventListener("click", async () => {
+            const language = document.getElementById("language").value;
+            const code = document.getElementById("code").value;
+
+            document.getElementById("output").textContent = "Running in Kubernetes...";
+
+            const res = await fetch("/run-code", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ language, code })
+            });
+
+            const data = await res.json();
+            document.getElementById("output").textContent = data.output || data.error;
+        });
+    </script>
+</body>
+</html>
