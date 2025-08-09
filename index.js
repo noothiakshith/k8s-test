@@ -56,7 +56,6 @@ app.post('/run-code', async (req, res) => {
         },
       ],
       restartPolicy: "Never",
-      terminationGracePeriodSeconds: 5,  // give 5 seconds for graceful shutdown
     },
   };
 
@@ -69,7 +68,7 @@ app.post('/run-code', async (req, res) => {
     await k8sApi.createNamespacedPod({ namespace, body: podManifest });
     console.log("Pod creation request sent");
 
-    const maxWaitMs = 10000;
+    const maxWaitMs = 10000000;
     const pollIntervalMs = 500;
     const start = Date.now();
     let phase = "";
@@ -120,9 +119,6 @@ app.post('/run-code', async (req, res) => {
       logs = "(failed to fetch logs)";
     }
 
-    console.log("Deleting pod:", podName);
-    await k8sApi.deleteNamespacedPod({ name: podName, namespace, body: {} });
-    console.log("Pod deleted");
 
     if (podFailed) {
       console.log("Returning failure response");
@@ -139,15 +135,7 @@ app.post('/run-code', async (req, res) => {
   } catch (err) {
     console.error("Error during pod lifecycle:", err);
 
-    try {
-      console.log("Attempting to cleanup pod due to error");
-      await k8sApi.deleteNamespacedPod({ name: podName, namespace, body: {} });
-      console.log("Cleanup pod succeeded");
-    } catch (e) {
-      if (e.statusCode !== 404) {
-        console.error("Pod cleanup failed:", e.body?.message || e.message);
-      }
-    }
+  
 
     const errorMessage = err.body?.message || err.message;
     res.status(500).json({ error: "Failed to run code", details: errorMessage });
